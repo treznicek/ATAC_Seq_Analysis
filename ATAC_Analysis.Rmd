@@ -1,0 +1,1128 @@
+---
+title: "ATAC_Analysis"
+author: "Tim Reznicek"
+date: "2023-12-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(readxl)
+library(DESeq2)
+library(pheatmap)
+library(dplyr)
+library(reshape2)
+library(ggrepel)
+```
+
+
+```{r}
+# Load your data from an Excel file
+atac_seq_data <- read.csv('/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2160/VEH_vs_PLX5_all_MAvalues_inverted.tsv', sep = "\t")
+
+# Create separate data frames for each color category
+gray_dots <- atac_seq_data[atac_seq_data$P_value >= 0.001 | abs(atac_seq_data$M_value_inverted) <= 1.5, ]
+red_dots <- atac_seq_data[atac_seq_data$P_value < 0.001 & atac_seq_data$M_value_inverted > 1.5, ]
+blue_dots <- atac_seq_data[atac_seq_data$P_value < 0.001 & atac_seq_data$M_value_inverted < -1.5, ]
+
+# scatterplot
+p <- ggplot() +
+geom_point(data = gray_dots, aes(y = normalized_read_density_in_PLX5, x = normalized_read_density_in_VEH), 
+             shape = 21, fill = 'gray', colour = 'black', size = 3, stroke = 0.5, alpha = 0.5) +
+  geom_point(data = red_dots, aes(y = normalized_read_density_in_PLX5, x = normalized_read_density_in_VEH), 
+             shape = 21, fill = 'red', colour = 'black', size = 3, stroke = 0.5) +
+  geom_point(data = blue_dots, aes(y = normalized_read_density_in_PLX5, x = normalized_read_density_in_VEH), 
+             shape = 21, fill = 'blue', colour = 'black', size = 3, stroke = 0.5) +
+  labs(title = 'Differentially Accessible Chromatin Regions',
+       y = 'Normalized Read Density in PLX5',
+       x = 'Normalized Read Density in VEH') +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_classic() +
+  theme(
+    text = element_text(size = 16, family = "Arial"),
+    axis.title = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 16, family = "Arial"),
+    plot.title = element_text(size = 16, face = "bold", family = "Arial")
+)
+
+print(p)
+
+# Save
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2160/PLX5_vs_VEH_Scatterplot.png", plot = p, width = 10, height = 8)
+```
+```{r}
+# DESeq2 analysis of peak counts
+
+# Read the featureCounts output
+# Replace 'featureCounts_output.txt' with the path to your actual file
+counts_data <- read.table("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/count_matrix.tsv", header = TRUE, stringsAsFactors = FALSE)
+
+# Verify the structure of your counts_data and adjust the column index as needed
+# The count data typically starts from the 7th column
+counts_matrix <- as.matrix(counts_data[, 7:ncol(counts_data)])
+rownames(counts_matrix) <- counts_data$Geneid
+
+# Sample metadata
+# This should be a data frame where rows correspond to the samples (columns in counts_matrix)
+# and columns contain information about each sample (e.g., condition, type, patient ID)
+colData <- data.frame(condition = c('OPN5', 'VEH', 'OPN5', 'VEH', 'OPN5', 'VEH', 'OPN5', 'VEH'), patient = c('2160', '2160', '2161', '2161', '2281', '2281', '2920', '2920'))
+
+# Create DESeqDataSet object
+dds <- DESeqDataSetFromMatrix(countData = counts_matrix, colData = colData, design = ~ condition)
+
+# Proceed with DESeq2 analysis
+atacDDS <- DESeq(dds)
+atac_Rlog <- rlog(dds)
+pca_data <- plotPCA(atac_Rlog, intgroup = "condition", ntop = nrow(atac_Rlog), returnData = TRUE)
+
+# Add the sample names to the PCA results
+pca_data$patient <- atac_Rlog$patient
+
+# Create the ggplot object
+p <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition, label = patient)) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = patient), box.padding = 0.5, point.padding = 0.5, segment.size = 0.5) +
+  xlim(-100,100) +
+  ylim(-125,125) +
+  labs(title = "PCA Plot",
+       x = paste0("PC1: ", round(100 * attr(pca_data, "percentVar")[1]), "% variance"),
+       y = paste0("PC2: ", round(100 * attr(pca_data, "percentVar")[2]), "% variance")) +
+  scale_color_manual(values = c("VEH" = "#226ab3", "OPN5" = "#d10309")) +
+  theme_classic(base_family = "Arial") + 
+  theme(
+    text = element_text(size = 16, family = "Arial"),
+    axis.title = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 16, family = "Arial"),
+    plot.title = element_text(size = 16, face = "bold", family = "Arial")
+  )
+
+# Print the plot
+print(p)
+
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/PCA.svg", plot = p, width = 7, height = 6)
+```
+
+```{r}
+# Heatmap _mean_scores for significant genes.
+
+process_file <- function(filename, patient_id) {
+  data <- read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  # Filter out rows where PLX5_VEH_highlighted is not 'True'
+  data <- data[data$PLX5_VEH_highlighted == "True", ]
+  # Select and rename the relevant columns with patient_id
+  data <- data %>% select(name, PLX5_mean_score, VEH_mean_score)
+  colnames(data)[-1] <- paste(patient_id, colnames(data)[-1], sep="_")
+  return(data)
+}
+
+# Process each patient file
+patient2160 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/DiffMotifs/bindetect_results.txt", "patient_2160")
+#patient2161 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2161/DiffMotifs/bindetect_results.txt", "patient_2161")
+patient2281 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2281/DiffMotifs/bindetect_results.txt", "patient_2281")
+patient2920 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2920/DiffMotifs/bindetect_results.txt", "patient_2920")
+
+# Merging the data
+all_patients <- Reduce(function(x, y) merge(x, y, by = "name", all = TRUE), list(patient2160, patient2281, patient2920))
+
+# Remove rows with NA values
+all_patients <- na.omit(all_patients)
+
+# Convert to matrix for heatmap
+tf_matrix <- as.matrix(all_patients[, -1])  # exclude the 'name' column
+rownames(tf_matrix) <- all_patients$name
+
+# Heatmap
+ph <- pheatmap(tf_matrix, 
+         scale = "row",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         show_rownames = TRUE,
+         show_colnames = TRUE)
+
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/TF_heatmap_significant.png", plot = ph, width = 5, height = 6)
+```
+
+```{r}
+# Heatmap for fold changes
+
+# Function to get highlighted TFs
+get_highlighted_TFs <- function(filename) {
+  data <- read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  highlighted_TFs <- data$name[data$PLX5_VEH_highlighted == "True"]
+  return(highlighted_TFs)
+}
+
+# Get highlighted TFs from each patient file
+highlighted_TFs_2160 <- get_highlighted_TFs("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/DiffMotifs/bindetect_results.txt")
+highlighted_TFs_2161 <- get_highlighted_TFs("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2161/DiffMotifs/bindetect_results.txt")
+highlighted_TFs_2281 <- get_highlighted_TFs("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2281/DiffMotifs/bindetect_results.txt")
+highlighted_TFs_2920 <- get_highlighted_TFs("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2920/DiffMotifs/bindetect_results.txt")
+
+# Combine and deduplicate the list of highlighted TFs
+all_highlighted_TFs <- unique(c(highlighted_TFs_2160, highlighted_TFs_2161, highlighted_TFs_2281, highlighted_TFs_2920))
+
+# Modified process_file function to include only selected TFs
+process_file <- function(filename, patient_id) {
+  data <- read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  data <- data[data$name %in% all_highlighted_TFs, ]
+  # Select and rename the PLX5_VEH_change column with patient_id
+  data <- data %>% select(name, PLX5_VEH_change)
+  colnames(data)[-1] <- paste(patient_id, "PLX5_VEH_change", sep="_")
+  return(data)
+}
+
+# Process each patient file with patient ID
+patient2160 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/DiffMotifs/bindetect_results.txt", "patient_2160")
+patient2161 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2161/DiffMotifs/bindetect_results.txt", "patient_2161")
+patient2281 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2281/DiffMotifs/bindetect_results.txt", "patient_2281")
+patient2920 <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2920/DiffMotifs/bindetect_results.txt", "patient_2920")
+
+# Merging the data
+all_patients <- Reduce(function(x, y) merge(x, y, by = "name", all = TRUE), list(patient2160, patient2161, patient2281, patient2920))
+
+# Remove rows with NA values
+all_patients <- na.omit(all_patients)
+
+# Convert to matrix for heatmap
+tf_matrix <- as.matrix(all_patients[, -1])  # exclude the 'name' column
+rownames(tf_matrix) <- all_patients$name
+
+
+# Heatmap
+ph <- pheatmap(tf_matrix, 
+         scale = "row",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         show_rownames = TRUE,
+         show_colnames = TRUE)
+
+# Save the heatmap
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/TF_heatmap_PLX5_VEH_change.png", plot = ph, width = 15, height = 40)
+```
+
+```{r}
+# Transcription factor rank order plot
+
+process_file <- function(filename) {
+  data <- read.table(filename, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  data <- data %>%
+    filter(PLX5_VEH_highlighted == "True") %>%
+    mutate(`-log10_pvalue` = -log10(PLX5_VEH_pvalue)) %>%
+    arrange(PLX5_VEH_pvalue, desc(PLX5_VEH_change)) %>%
+    mutate(rank = row_number())  # Assigns rank based on sorted order
+  return(data)
+}
+
+# Process each patient file
+patient_data <- process_file("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/DiffMotifs/bindetect_results.txt")
+# Extract the top 15 ranked TFs
+top_15_TFs <- head(patient_data, 15)
+top_15_TFs
+# Plotting
+p <- ggplot(patient_data, aes(x = rank, y = `-log10_pvalue`)) +
+  geom_point() +
+  geom_text(data = top_15_TFs, aes(label = name), vjust = 2, hjust = 0.5, check_overlap = TRUE) +
+  theme_minimal() +
+  xlab("Rank based on P-value and Fold Change") +
+  ylab("-log10(P-value)") +
+  ggtitle("Rank Ordered Plot of Differentially Accessible TF Motifs")
+
+print(p)
+
+```
+
+GO for OPN5/CTL regulated genes: peak list, get overlapping TSS regions that are the same between OPN5 treatments and CTLs. Put those into EnrichR.  
+
+This intersection is rough. A small amount of overlapped significant peaks. For this reason:  
+1. Make a master list of manorm +/- peaks. .... but why? Instead, make a master list of genes from the promoter homer file.  
+2. Overlap of that list with TSS of genes from gene list.  
+3. Extract BPM values from each bigwig for each sample.  
+4. Fold change calculated and use that in the GO analysis.  
+5. What about p-value for GSEA???? (student's t-test)  Don't need. Calculate ranks based on geometric mean of the samples changes.
+6. 
+
+### GSVA analysis:
+```{r}
+library(GSVA)
+library(GSEABase)
+library(limma)
+library(readr)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(dplyr)
+```
+To perform GSVA analysis based on ATAC seq data only, I will take signal at gene promoters (-1000/+100 bp from TSS).  
+Get TSS list for all genes. Didn't do this, it's too hard.  
+
+#### Run the GSVA
+```{r}
+# Read the data into a data frame
+expressionData <- read.csv("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Master_GSVA_Matrix_diffcondense_no2920.tsv", sep="\t", header=TRUE, check.names = FALSE)
+
+# Explicitly set row names from the first column (assuming it's named 'gene')
+rownames(expressionData) <- expressionData$gene
+
+# Drop the first column by creating a new data frame without the 'gene' column
+expressionData <- expressionData[, -1, drop = FALSE]
+
+# Convert all other columns to numeric, ensuring to preserve the data frame structure
+# This step is crucial if your data frame columns are not already in numeric format
+#expressionData <- data.frame(lapply(expressionData, as.numeric), check.names = FALSE)
+
+# Now, convert the data frame to a matrix
+exprMatrix <- as.matrix(expressionData)
+
+# Verify that row names are preserved
+head(rownames(exprMatrix))
+
+
+# Define the file names and the corresponding names for the gene sets
+gene_set_files <- c("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/RNAseq_Signatures/EffectorMemory_CD8.bed", "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/RNAseq_Signatures/NaiveLike_CD8.bed", "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/RNAseq_Signatures/Tex_CD8", "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/RNAseq_Signatures/Tpex_CD8")
+gene_set_names <- c("EffectorMemory", "NaiveLike", "Tex", "Tpex")
+
+# Initialize an empty list to store the gene sets
+geneSets <- list()
+
+# Loop over the file names, read the gene names from each file, and add to the list
+for (i in 1:length(gene_set_files)) {
+  gene_names <- readLines(gene_set_files[i])
+  geneSets[[gene_set_names[i]]] <- gene_names
+}
+
+
+#geneSets
+
+# Convert the list of gene sets to GeneSet objects
+# geneSetObjects <- lapply(names(geneSets), function(x) {
+#   GeneSet(geneIds = geneSets[[x]], setName = x, pubMedIds = '', urls = '', contributor = '', creationDate = '')
+# })
+
+# Creating a GeneSetCollection from the GeneSet objects
+#geneSetCollection <- GeneSetCollection(geneSetObjects, setType = "GeneSet")
+
+
+# Run GSVA
+#gsvaResults <- gsva(expressionData, geneSets, method="gsva", kcdf="Gaussian", min.sz=1, max.sz=Inf, mx.diff=TRUE, verbose=TRUE)
+
+gsva_res <- gsva(exprMatrix, geneSets, method="ssgsea", kcdf="Gaussian", min.sz=1, max.sz=Inf, mx.diff=TRUE, verbose=TRUE)
+gsva_res
+write.csv(gsva_res, "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/RNAseq_Signatures/highest_diff/no_2920/GSVA_RNAseq_scores_no2920.csv")
+```
+
+#### GSVA Analysis
+```{r}
+# samples <- c("OPN5_2160","VEH_2160","OPN5_2161","VEH_2161","OPN5_2281","VEH_2281", "OPN5_2920", "VEH_2920")
+groups <- c("OPN5","VEH","OPN5","VEH","OPN5","VEH")#,"OPN5","VEH") # use these last 2 for 2920
+
+# condition <- data.frame(sample = samples, group = groups)
+
+group <- factor(groups)  # condition should be a vector indicating the condition of each sample
+esMeans <- apply(gsva_res, 1, function(x) tapply(x, group, mean))
+esDiff <- esMeans[,1] - esMeans[,2]  # Difference in means between the two conditions
+esMeans
+esDiff
+```
+
+
+#### GSVA distributions:
+```{r}
+# Convert the GSVA scores matrix to a long format
+meltedScores <- melt(gsva_res, varnames = c("GeneSet", "Sample"), value.name = "GSVAScore")
+
+# Categorize samples into groups (assuming sample names indicate their group)
+meltedScores$Group <- ifelse(grepl("OPN5", meltedScores$Sample), "OPN5", "VEH")
+
+# Adjust the order of 'Group' to have VEH first and OPN5 second
+meltedScores$Group <- factor(meltedScores$Group, levels = c("VEH", "OPN5"))
+
+results <- meltedScores %>%
+  group_by(GeneSet) %>%
+  summarize(p_value = t.test(GSVAScore ~ Group)$p.value) %>%
+  mutate(Significance = case_when(
+    p_value <= 0.01 ~ "**",
+    p_value <= 0.05 ~ "*",
+    TRUE ~ ""
+  ))
+
+results$y_coord <- max(meltedScores$GSVAScore)
+
+write.csv(results, "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/significance_table.csv", row.names = FALSE)
+
+# Plotting with adjustments
+bp <- ggplot(meltedScores, aes(x = GeneSet, y = GSVAScore, fill = Group)) +
+  geom_boxplot(alpha = 0.5, position = position_dodge(width = 0.75)) +
+  geom_point(aes(color = Group), position = position_dodge(width = 0.75), size = 2.5) +
+  scale_fill_manual(values = c("VEH" = "#d10309", "OPN5" = "#226ab3")) +
+  scale_color_manual(values = c("VEH" = "#d10309", "OPN5" = "#226ab3")) +
+  theme_minimal() +
+  labs(title = "GSVA Scores by Sample Group and Gene Set", x = "Gene Set", y = "GSVA Score") +
+  theme(legend.title = element_blank(), legend.position = "top") +
+  geom_text(data = results, aes(x = GeneSet, y = y_coord, label = Significance), inherit.aes = FALSE, vjust = -0.5)
+
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/RNAseq_Signatures_boxplot_diffcondense.png", plot = bp, width = 8, height = 8, bg = 'white')
+
+```
+
+#### Lil heatmap
+```{r}
+# Assuming geneSets is your list of gene sets
+allGenes <- unique(unlist(geneSets))
+
+# Subset the expression matrix to include only the genes in your gene sets
+expressionSubset <- exprMatrix[rownames(exprMatrix) %in% allGenes, ]
+expressionCapped <- expressionSubset
+expressionCapped[expressionCapped > 300] <- 300
+
+ph <- pheatmap(expressionCapped,
+         scale = "none",  # Use raw expression values
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         color = colorRampPalette(c("yellow", "orange", "red"))(255),  # Color gradient
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         fontsize_row = 6,
+         fontsize_col = 8,
+         border_color = NA) 
+
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/sc_Signatures_fullHeatmap.png", plot = ph, width = 8, height = 12, bg = 'white')
+```
+
+#### Heatmap for each gene set
+```{r}
+
+for (geneSetName in names(geneSets)) {
+  # Get the gene names for the current gene set
+  genesInSet <- geneSets[[geneSetName]]
+  
+  # Subset the expression data for the current gene set
+  # Ensure gene names in geneSets exactly match row names in expressionSubset
+  currentExpressionSubset <- expressionSubset[rownames(expressionSubset) %in% genesInSet, ]
+  
+  # Cap expression values at 200 for the current subset
+  # currentExpressionCapped <- currentExpressionSubset
+  # currentExpressionCapped[currentExpressionCapped > 200] <- 200
+  
+  # Generate heatmap for the current gene set
+  ph <- pheatmap(currentExpressionSubset,
+           scale = "row",
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           clustering_method = "complete",
+           color = colorRampPalette(c("yellow", "orange", "red"))(255),  # Color gradient
+           show_rownames = TRUE,
+           show_colnames = TRUE,
+           fontsize_row = 6,
+           fontsize_col = 8,
+           border_color = NA,
+           main = paste("Heatmap for Gene Set:", geneSetName))  # Add a title for each heatmap
+  ggsave(filename = paste0("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/GenomeAnnotation/Figures/sc_Signatures_", geneSetName, "_Heatmap.png"), plot = ph, width = 5, height = 6, bg = 'white')
+}
+```
+
+Next, I have several bed files of signatures from scATAC-seq data. Get the GSVA scores for each of these bed files, reproduce the above analysis.  
+
+This is done by:  
+1. Creating a master list of these regions, updating the gene name column 4 to be a union of the three columns by "_".  
+2. Remove any duplicate lines from the master list.  
+  2a. Add the gene list from the other studies, ensure that there are no overlaps. Actually, do I care? no. Just add the genes and see how it goes.  
+3. Pull bigiwg signatures for the regions for each sample.  
+4. Convert the .beds into just their "gene name" function.  
+5. Reproduce the GSVA analysis from there.  
+
+Done. Doesn't look the most promising.  
+
+Tomorrow move on to:  
+*Getting motifs from homer under ATAC seq peaks*...for genes?...for every peak?...  
+  Then make heatmap of those motifs enrichment.  
+
+*Average ATAC-seq signal at BRD4 and H3K27 ChIP regions*:  
+  Call peaks for the tracks, use those peaks as anchor points for deeptools heatmaps  
+  Whatabout vice versa with the master peak list I have for ATAC-seq signal?  
+  
+After that make sure everything is uploaded and yea  
+
+Have to call peaks for the BRD4 data using bedgraphs from bigwig data. Suboptimal.  
+First call: 
+```
+macs2 callpeak -t PLX_H3K27Ac.bedGraph -c Stim_H3K27Ac.bedGraph -f BED -n Stim_H3K27Ac_control --outdir /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Peak_Calls/H3K27Ac --nomodel --extsize 147 --shift -73 -g hs -q 0.01
+
+
+```
+Looking at the bigwigs, they are incredibly sparse and I don't think I can call peaks on them. The best I can probably do in that case is to use the peaks of the ATAC-seq and look at the signal under those. What is a question I can ask...?  
+
+After PLX5 treatment, we see differential peaks. Under those peaks, are there peaks with differential BRD4 signal, and does that relate in any way to H3K27Ac?  
+
+So: Get differential ATAC-seq peak lists for each sample by intersecting the master list and each individual peaks list. Look at the manorm list as well.  
+
+patient:  
+  peaks for this patient control  
+  peaks for this patient treatment  
+  master peaks list  
+  unique peaks for control and treatment  
+  
+all patients: 
+  combine master and uniques for all patients  
+  remove duplicates, intersect the uniques with the master.
+  confirm these are unique with deeptools.  
+  use the bigwig files for T-cell ChIP-seq with deeptools to view any changes, try to separate where those are.  
+  
+  
+I have the biased and unbiased lists.  
+What I can do is create a biased list towards control and treatment that must have a peak in all files, and one that is just the combination of all the files.  
+Then, do the heatmaps for those. Doesn't have to be perfect, just needs to be done. In the future I'll handle this more elegantly.  
+
+I have unique VEH and PLX5 peaks. Prove they are unique by combining atac-seq signal and comparing in deep tools.  
+Then, if this works, show the signal in the published data at the peaks to compare them.  
+
+```
+# Combine bigwigs
+bigWigToBedGraph input1.bw output1.bedGraph
+bigWigToBedGraph input2.bw output2.bedGraph
+bigWigToBedGraph input3.bw output3.bedGraph
+bigWigToBedGraph input4.bw output4.bedGraph
+
+bedtools unionbedg -i output1.bedGraph output2.bedGraph output3.bedGraph output4.bedGraph | awk '{sum=0; for(i=4;i<=NF;i++) sum+=$i; print $1,$2,$3,sum/NF-3;}' > combined.bedGraph
+
+bedGraphToBigWig combined.bedGraph chrom.sizes combined.bw
+```
+
+```
+# make sure any overlapping regions are combined
+# Combined peaks: 
+awk -F'\t' '{print $1"\t"$2"\t"$3}' Patient_2281/output_filters/VEH_specific_peaks.bed >> combined_VEH_peaks.bed
+# Make a master list, remove duplicates, verify versus the unique list.
+```
+
+```
+# deeptools heatmaps:
+
+computeMatrix reference-point --referencePoint center -b 3000 -a 3000 -R ../PLX_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/GSM5573168_Stim_H3K27Ac.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/GSM5573171_PLX_H3K27Ac.bw --skipZeros -o matrix_h3K27ac.gz --outFileSortedRegions regions.bed
+
+plotHeatmap -m matrix_h3K27ac.gz -out heatmap.png --regionsLabel "PLX Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap RdBu --whatToShow 'heatmap and colorbar'
+
+
+# Checking the peaks
+computeMatrix reference-point --referencePoint center -b 3000 -a 3000 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/combined_bigwigs/OPN5_combined.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/combined_bigwigs/VEH_combined.bigwig --skipZeros -o matrix_ATACseq.gz --outFileSortedRegions regions.bed
+
+plotHeatmap -m matrix_ATACseq.gz -out heatmap.png --regionsLabel "PLX Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap RdBu --whatToShow 'heatmap and colorbar'
+
+plotHeatmap -m matrix_ATACseq.gz -out heatmap.png --regionsLabel "OPN5 Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar'
+####################################
+# Peaks look good
+# Make  a bunch of matrices in different places to reproduce them 
+####################################
+###################################################
+# Stim Comparison
+computeMatrix reference-point --referencePoint center -b 1000 -a 1000 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Stim_BRD4_mod.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Stim_H3K27Ac_mod.bw -o Matrices/matrix_Stim_BRD4vAc.gz --outFileSortedRegions Regions/Stim_BRD4vAc_regions.bed
+
+plotHeatmap -m Matrices/matrix_Stim_BRD4vAc.gz -out heatmap_Stim_BRD4vAc.png --regionsLabel "OPN5 Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --zMin 0 --zMax 20 --missingDataColor white
+###################################################
+# OPN5 Comparison
+computeMatrix reference-point --referencePoint center -b 1000 -a 1000 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/PLX_BRD4_mod.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/PLX_H3K27Ac_mod.bw -o Matrices/matrix_PLX_BRD4vAc.gz --outFileSortedRegions Regions/PLX_BRD4vAc_regions.bed
+
+plotHeatmap -m Matrices/matrix_PLX_BRD4vAc.gz -out heatmap_PLX_BRD4vAc.png --regionsLabel "OPN5 Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white
+###################################################
+# H3K27Ac change
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Stim_H3K27Ac_mod.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/PLX_H3K27Ac_mod.bw -o Matrices/matrix_Ac_change.gz --outFileSortedRegions Regions/Ac_change_regions.bed --sortRegions ascend --binSize 32 --missingDataAsZero
+
+plotHeatmap -m Matrices/matrix_Ac_change.gz -out heatmap_Ac_change.png --regionsLabel "OPN5 Unique ATAC" "VEH Unique ATAC" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap icefire --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 2.0 --zMax 5.5
+###################################################
+# BRD4 Change
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Stim_BRD4_mod.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/PLX_BRD4_mod.bw -o Matrices/matrix_BRD4_change.gz --outFileSortedRegions Regions/BRD4_change_regions.bed --sortRegions ascend --binSize 32 --missingDataAsZero
+
+plotHeatmap -m Matrices/matrix_BRD4_change.gz -out heatmap_BRD4_change.png --regionsLabel "OPN5 Unique ATAC" "VEH Unique ATAC" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap icefire --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 1.25 --zMax 3.5
+###################################################
+```
+
+```
+# These heatmaps look rough, trying to look into their profiles to get some visualization of the signal.
+plotProfile -m Matrices/matrix_Stim_BRD4vAc.gz \
+             -out profile_Stim_BRD4vAc.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors blue red \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+
+plotProfile -m Matrices/matrix_PLX_BRD4vAc.gz \
+             -out profile_PLX_BRD4vAc.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors blue red \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotProfile -m Matrices/matrix_Ac_change.gz \
+             -out profile_Ac_Change.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors blue red \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotProfile -m Matrices/matrix_BRD4_change.gz \
+             -out profile_BRD4_change.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors blue red \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+
+```
+
+
+I am close to d3th.  
+Start all four chipseq pipelines.  
+Didn't do this because I have no idea what the controls are.  
+Moving on to make the heatmap of enriched motifs.  
+```
+# 2160
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2160/output_filters/PLX5_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/HOMER_Res/OPN5
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2160/output_filters/CTL_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/HOMER_Res/VEH
+
+# 2161
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2161/output_filters/PLX5_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2161/HOMER_Res/OPN5
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2161/output_filters/VEH_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2161/HOMER_Res/VEH
+
+# 2281
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2281/output_filters/PLX5_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2281/HOMER_Res/OPN5
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2281/output_filters/VEH_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2281/HOMER_Res/VEH
+
+# 2920
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2920/output_filters/PLX5_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2920/HOMER_Res/OPN5
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2920/output_filters/VEH_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2920/HOMER_Res/VEH
+
+```
+
+
+Also comparison to sorted CD8+ T-cell subpop ATAC-seq.
+I have a .csv file which contains a header with chr, start, end, and then a whole bunch of sample names that I don't know where they relate to. That is pretty important.  
+I need to:  
+1. Add columns for each patient and treatment and generate their log2batch corrected scores from their associated bigwigs.  
+2. PCA plot comparison of subgroups.  
+3. It's that easy.  
+4. GSVA seems more annoying.  
+
+
+```
+ES=(−log10​(P-value))×(% of Background Sequences with Motif / % of Target Sequences with Motif​)
+```
+
+```{r}
+# Processing Homer Results:
+
+# Read the data
+motif_scores <- read.csv("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Homer_motif_enrichment_scores.csv")
+
+# Melt the data for use with ggplot2
+motif_scores_melted <- melt(motif_scores, id.vars = "Motif_Name")
+
+# Plot heatmap
+ph <- ggplot(motif_scores_melted, aes(x = variable, y = `Motif_Name`, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = c("yellow", "orange", "red"), 
+                       limits = c(0, 100),  # Ensure this matches the max_score used in Python
+                       breaks = seq(0, 100, by = 10),  # Adjust breaks as needed
+                       na.value = "white") +
+  theme_minimal() +
+  labs(title = "Motif Enrichment Scores", x = "Sample", y = "Motif", fill = "Score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+ph
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Homer_motif_heatmap.png", plot = ph, bg = 'white', width = 15, height = 35)
+
+```
+
+```{r}
+# Clustered Heatmap
+motif_scores <- read.csv("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Homer_motif_enrichment_scores_sorted.csv")
+
+motif_scores_filtered <- motif_scores %>%
+  rowwise() %>%
+  filter(sum(is.na(c_across(-`Motif_Name`))) <= 1) %>%
+  ungroup()
+
+# Melt the filtered data for ggplot
+motif_scores_melted <- melt(motif_scores_filtered, id.vars = "Motif_Name")
+
+# Adjusting dcast to use mean as the aggregation function
+motif_matrix_pre <- dcast(motif_scores_melted, Motif_Name ~ variable, value.var = "value", fun.aggregate = mean)
+
+# Manually setting row names and converting to matrix
+rownames(motif_matrix_pre) <- motif_matrix_pre$Motif_Name
+motif_matrix <- as.matrix(motif_matrix_pre[,-1])  # Remove the first column now
+
+# Replace NA, handle Inf and extreme values
+motif_matrix[is.na(motif_matrix)] <- 0  # Replace NA with 0
+motif_matrix[is.infinite(motif_matrix)] <- 1  # Replace Inf with a finite number, adjust based on your data range
+
+# Ensure no columns are converted entirely to 1 due to the dcast operation
+if(all(motif_matrix == 1, na.rm = TRUE)) {
+  stop("Error: All values in the matrix are 1. Check dcast operation and data integrity.")
+}
+
+# Define the color palette with the desired number of colors
+color_palette <- colorRampPalette(c("yellow", "orange", "red"))(100)
+
+# Generate breaks from 0 to 100 (inclusive)
+#breaks <- seq(0, 60, length.out = length(color_palette))
+
+# Plot heatmap with custom breaks
+ph <- pheatmap(motif_matrix,
+               clustering_distance_rows = "euclidean",
+               clustering_distance_cols = "euclidean",
+               cluster_rows = TRUE,
+               cluster_cols = TRUE,
+               color = color_palette,
+               border_color = NA,  # Hide cell borders
+               scale = "none",
+               breaks = breaks,  # Use the custom breaks
+               show_rownames = FALSE,
+               show_colnames = TRUE,
+               main = "Clustered Heatmap of Motif Enrichment Scores")
+
+
+  
+ph
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Homer_motif_clustered_heatmap.png", plot = ph, bg = 'white', width = 15, height = 35)
+
+```
+
+```{r}
+# Sub Promoters:
+
+# Filter for 'Promoter' motifs
+promoter_motifs <- motif_matrix_pre[grep("Promoter", motif_matrix_pre$Motif_Name), ]
+
+# Convert to matrix
+promoter_motif_matrix <- as.matrix(promoter_motifs[,-1])
+rownames(promoter_motif_matrix) <- promoter_motifs$Motif_Name
+
+# Adjust row names to keep only characters before the first '('
+adjusted_row_names <- sub("\\(.*$", "", rownames(promoter_motif_matrix))
+
+# Apply adjusted row names back to the matrix
+rownames(promoter_motif_matrix) <- adjusted_row_names
+
+# Define the color palette with the desired number of colors
+color_palette <- colorRampPalette(c("yellow", "orange", "red"))(100)  # Use 100 colors across the range
+
+# Plot heatmap with row scaling
+ph <- pheatmap(promoter_motif_matrix,
+               clustering_distance_rows = "euclidean",
+               clustering_distance_cols = "euclidean",
+               cluster_rows = TRUE,
+               cluster_cols = TRUE,
+               color = color_palette,  # Use the defined color palette
+               border_color = NA,  # Hide cell borders
+               scale = "row",  
+               show_rownames = TRUE,
+               show_colnames = TRUE,
+               main = "Promoter Motif Enrichment Scores")
+
+
+ph
+
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Homer_promoter_motif_clustered_heatmap.png", plot = ph, bg = 'white', width = 10, height = 10)
+```
+```{r}
+# Find rows with constant values
+constant_rows <- apply(promoter_motif_matrix, 1, function(x) length(unique(x)) == 1)
+
+# If any constant rows exist, you might consider removing them or adjusting the values slightly
+if(any(constant_rows)) {
+  cat("Constant rows detected. Consider removing or adjusting these rows.\n")
+}
+```
+
+
+```{r}
+#############
+# Trying to get the most differential motifs
+##############
+# Step 1: Convert motif_matrix back to a data frame for easier manipulation
+motif_df <- data.frame(motif_matrix, check.names = FALSE)
+motif_df$Motif_Name <- rownames(motif_matrix)
+
+# Step 2: Apply the significance filter
+significant_motifs <- motif_df %>%
+  rowwise() %>%
+  mutate(OPN5_below_threshold = sum(c_across(starts_with("OPN5")) < 1.3),
+         VEH_above_threshold = sum(c_across(starts_with("VEH")) > 1.3),
+         is_significant = OPN5_below_threshold >= 3 & VEH_above_threshold >= 3 |
+                          OPN5_below_threshold <= 3 & VEH_above_threshold <= 3) %>%
+  filter(is_significant) %>%
+  select(-c(OPN5_below_threshold, VEH_above_threshold, is_significant))
+
+# Step 3: Prepare the matrix for significant motifs
+significant_motifs_matrix <- as.matrix(significant_motifs[,-ncol(significant_motifs)])
+rownames(significant_motifs_matrix) <- significant_motifs$Motif_Name
+
+# Adjust row names to keep only characters before the first '('
+adjusted_row_names <- sub("\\/.*$", "", rownames(significant_motifs_matrix))
+
+# Apply adjusted row names back to the matrix
+rownames(significant_motifs_matrix) <- adjusted_row_names
+
+# Plot the heatmap with significant motifs only
+ph <- pheatmap(significant_motifs_matrix,
+               color = color_palette,
+               border_color = NA,
+               scale = "row",
+               show_rownames = TRUE,
+               show_colnames = TRUE,
+               main = "Significant Motif Enrichment Scores")
+
+
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Homer_topdiff_motif_clustered_heatmap.png", plot = ph, bg = 'white', width = 10, height = 30)
+```
+
+```
+# Sanity check: plot those shiny new bigwigs.
+
+###################################################
+# Stim Comparison
+computeMatrix reference-point --referencePoint center -b 1000 -a 1000 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Stim_BRD4_mod.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/Stim_H3K27Ac_mod.bw -o Matrices/matrix_Stim_BRD4vAc.gz --outFileSortedRegions Regions/Stim_BRD4vAc_regions.bed
+
+plotHeatmap -m Matrices/matrix_Stim_BRD4vAc.gz -out heatmap_Stim_BRD4vAc.png --regionsLabel "OPN5 Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --zMin 0 --zMax 20 --missingDataColor white
+###################################################
+# OPN5 Comparison
+computeMatrix reference-point --referencePoint center -b 1000 -a 1000 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/PLX_BRD4_mod.bw /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/Published_Data/PLX_H3K27Ac_mod.bw -o Matrices/matrix_PLX_BRD4vAc.gz --outFileSortedRegions Regions/PLX_BRD4vAc_regions.bed
+
+plotHeatmap -m Matrices/matrix_PLX_BRD4vAc.gz -out heatmap_PLX_BRD4vAc.png --regionsLabel "OPN5 Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white
+###################################################
+# H3K27Ac change
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838083/DMSO_H3K27Ac.pval.signal.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838086/DATATOKEEP/signal/rep1/PLX_H3K27Ac.pval.signal.bigwig -o Matrices/matrix_Ac_change.gz --outFileSortedRegions Regions/Ac_change_regions.bed --sortRegions ascend --missingDataAsZero -p 30
+
+plotHeatmap -m Matrices/matrix_Ac_change.gz -out heatmap_Ac_change.png --regionsLabel "OPN5 Unique ATAC" "VEH Unique ATAC" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0.4 --zMax 1.5
+###################################################
+# BRD4 Change
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838085/DATATOKEEP/signal/rep1/DMSO_BRD4.pval.signal.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838088/DATATOKEEP/signal/rep1/PLX_BRD4.pval.signal.bigwig -o Matrices/matrix_BRD4_change.gz --outFileSortedRegions Regions/BRD4_change_regions.bed --sortRegions ascend --missingDataAsZero -p 30
+
+plotHeatmap -m Matrices/matrix_BRD4_change.gz -out heatmap_BRD4_change.png --regionsLabel "OPN5 Unique ATAC" "VEH Unique ATAC" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0.35 --zMax 0.9
+###################################################
+
+# These heatmaps look rough, trying to look into their profiles to get some visualization of the signal.
+plotProfile -m Matrices/matrix_Stim_BRD4vAc.gz \
+             -out profile_Stim_BRD4vAc.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors blue red \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+
+plotProfile -m Matrices/matrix_PLX_BRD4vAc.gz \
+             -out profile_PLX_BRD4vAc.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors blue red \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotProfile -m Matrices/matrix_Ac_change.gz \
+             -out profile_Ac_Change.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors red blue \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotProfile -m Matrices/matrix_BRD4_change.gz \
+             -out profile_BRD4_change.png \
+             --perGroup \
+             --regionsLabel "PLX Unique ATAC" "VEH Unique ATAC" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors red blue \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+
+```
+
+Super weird results looking at sites of ATAC seq peaks. Looks like you gain BRD4 post treatment. But we lose called BRD4 peaks.  
+
+Call differential peaks between BRD4 sites and H3K27c sites. Call them as being towards one or the other (DMSO or OPN). Then make heatmaps to see difference in signal at these peaks, and also plot the ATAC seq signal for kicks.  
+
+```
+########################################
+# Now I am confirming that differential peak calling worked in the ChIP-seq
+########################################
+
+# Show me...H3K27Ac signal in H3K27ac OPN5 and VEH specific peaks
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R H3K27Ac/output_filters/OPN5_specific_peaks.bed H3K27Ac/output_filters/VEH_specific_peaks.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838083/DATATOKEEP/signal/DMSO_H3K27Ac.pval.signal.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838086/DATATOKEEP/signal/rep1/PLX_H3K27Ac.pval.signal.bigwig -o Matrices/matrix_Ac_change.gz --outFileSortedRegions Regions/Ac_change_regions.bed --sortRegions ascend --missingDataAsZero -p 23
+
+# ...BRD4 signal in BRD4 peaks
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R BRD4/output_filters/OPN5_specific_peaks.bed BRD4/output_filters/VEH_specific_peaks.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838085/DATATOKEEP/signal/rep1/DMSO_BRD4.pval.signal.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/GSE183883/fastq/SRR15838088/DATATOKEEP/signal/rep1/PLX_BRD4.pval.signal.bigwig -o Matrices/matrix_BRD4_change.gz --outFileSortedRegions Regions/BRD4_change_regions.bed --sortRegions ascend --missingDataAsZero -p 23
+
+plotProfile -m Matrices/matrix_Ac_change.gz \
+             -out profile_Ac_Change.png \
+             --perGroup \
+             --regionsLabel "OPN5 Unique ChIP-seq" "VEH Unique ChIP-seq" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors red blue \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotProfile -m Matrices/matrix_BRD4_change.gz \
+             -out profile_BRD4_change.png \
+             --perGroup \
+             --regionsLabel "OPN5 Unique ChIP-seq" "VEH Unique ChIP-seq" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors red blue \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotHeatmap -m Matrices/matrix_Ac_change.gz -out heatmap_Ac_change.png --regionsLabel "OPN5 ChIP-seq Peaks" "VEH ChIP-seq Peaks" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0 --zMax 25
+
+plotHeatmap -m Matrices/matrix_BRD4_change.gz -out heatmap_BRD4_change.png --regionsLabel "OPN5 ChIP-seq Peaks" "VEH ChIP-seq Peaks" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0 --zMax 15
+
+########################################
+# What about ATAC signal at these peaks?
+########################################
+
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R H3K27Ac/output_filters/OPN5_specific_peaks.bed H3K27Ac/output_filters/VEH_specific_peaks.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Combined_Bigwigs/VEH_combined.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Combined_Bigwigs/OPN5_combined.bigwig -o Matrices/matrix_ATAC_change_Ac_peaks.gz --outFileSortedRegions Regions/ATAC_change_Ac_peaks_regions.bed --sortRegions ascend --missingDataAsZero -p 23
+
+computeMatrix reference-point --referencePoint center -b 3200 -a 3200 -R BRD4/output_filters/OPN5_specific_peaks.bed BRD4/output_filters/VEH_specific_peaks.bed -S /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Combined_Bigwigs/VEH_combined.bigwig /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Combined_Bigwigs/OPN5_combined.bigwig -o Matrices/matrix_ATAC_change_BRD4_peaks.gz --outFileSortedRegions Regions/ATAC_change_BRD4_peaks_regions.bed --sortRegions ascend --missingDataAsZero -p 23
+
+plotProfile -m Matrices/matrix_ATAC_change_Ac_peaks.gz \
+             -out profile_ATAC_change_Ac_peaks.png \
+             --perGroup \
+             --regionsLabel "OPN5 Unique ChIP-seq" "VEH Unique ChIP-seq" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors red blue \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotProfile -m Matrices/matrix_ATAC_change_BRD4_peaks.gz \
+             -out profile_ATAC_change_BRD4_peak.png \
+             --perGroup \
+             --regionsLabel "OPN5 Unique ChIP-seq" "VEH Unique ChIP-seq" \
+             --plotTitle "Average Signal at Anchor Points" \
+             --colors red blue \
+             --refPointLabel "Center" \
+             --yAxisLabel "Signal intensity"
+             
+plotHeatmap -m Matrices/matrix_ATAC_change_Ac_peaks.gz -out heatmap_ATAC_change_Ac_peak.png --regionsLabel "OPN5 ATAC-seq" "VEH ATAC-seq" --plotTitle "Signal at Anchor Points" --heatmapHeight 9 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0 --zMax 150
+
+plotHeatmap -m Matrices/matrix_ATAC_change_BRD4_peaks.gz -out heatmap_ATAC_change_BRD4_peak.png --regionsLabel "OPN5 ATAC-seq" "VEH ATAC-seq" --plotTitle "Signal at Anchor Points" --heatmapHeight 9 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0 --zMax 200
+```
+```
+# Checking the peaks
+computeMatrix reference-point --referencePoint center -b 3000 -a 3000 -R ../PLX5_unique_frommaster.bed ../VEH_unique_frommaster.bed -S OPN5_combined.bigwig VEH_combined.bigwig --skipZeros -o Matrices/matrix_ATACseq.gz --outFileSortedRegions Regions/ATAC_regions.bed --sortRegions ascend --missingDataAsZero -p 23
+
+plotHeatmap -m matrix_ATACseq.gz -out heatmap.png --regionsLabel "PLX Unique" "VEH Unique" --plotTitle "Signal at Anchor Points" --heatmapHeight 7 --colorMap RdBu --whatToShow 'heatmap and colorbar'
+
+plotHeatmap -m matrix_ATACseq.gz -out ATAC_heatmap.png --regionsLabel "OPN5 ATAC" "VEH ATAC" --plotTitle "Signal at Anchor Points" --heatmapHeight 9 --colorMap Reds --whatToShow 'heatmap and colorbar' --missingDataColor white --zMin 0 --zMax 20
+```
+
+Each value has individual score (peak score), summarize the score for each peak.  
+TF motif.  
+Collective volcano plot: promoter regions that are significantly different, log2fold difference between them.  
+She wants vehicle biased and OPN5 biased, just give a text file that has all differentially expressed. Differentially expressed peaks. Only show a summary.  
+Files from the heatmaps as well.  
+
+Legends, methods, volcano plot, heatmaps.  
+
+```{r}
+# Volcano Plots
+#Read in files
+dar_OPN5vVEH <-read.csv("/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/avg_manorm_counts_OPN5vVEH_annot_gene.tsv",
+                        header = TRUE,
+                        sep = "\t")
+
+# Check if the data is read correctly and the types are as expected
+#str(deg_ECDvVEC) 
+
+dar_OPN5vVEH_filtered <- dar_OPN5vVEH %>%
+  filter(file_count >= 3)
+
+#deg_ECDvVEC_FC1
+dar_OPN5vVEH_FC1 <- dar_OPN5vVEH_filtered %>%
+  mutate(gene_type = case_when(M_value >= 1 & P_value <= 0.05 ~ "up",
+                               M_value <= -1 & P_value <= 0.05 ~ "down",
+                               TRUE ~ "ns"))
+
+head(dar_OPN5vVEH_FC1) 
+
+dar_OPN5vVEH_FC1 %>%
+  dplyr::count(gene_type)
+
+# Set colors for points in the volcano plot
+cols <- c("up" = "#d10309", "down" = "#226ab3", "ns" = "grey") 
+sizes <- c("up" = 2, "down" = 2, "ns" = 1) 
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Vector for genes of interest
+genes_of_interest <- c("CLECL1", "TNFRSF18", "TNFRSF9", "CD101", "FNDC9", "BATF3") 
+
+genes_of_interest_with_promoter <- dar_OPN5vVEH_FC1 %>%
+  filter(Gene_Name %in% genes_of_interest & grepl("promoter", Annotation, ignore.case = TRUE))
+
+# Now, proceed with the plot, using this filtered dataset for labeling
+OPN5vVEH_vol_plot <- dar_OPN5vVEH_FC1 %>%
+  ggplot(aes(x = M_value, y= -log10(P_value))) +
+  geom_point(aes(fill = gene_type, size = gene_type, alpha = gene_type),
+             shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") + 
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_label_repel(
+    data = genes_of_interest_with_promoter,
+    aes(label = Gene_Name), 
+    size = 4, 
+    box.padding = unit(0.35, "lines"),
+    point.padding = unit(0.5, "lines"), 
+    segment.color = 'grey50',
+    fill = "white",
+    show.legend = FALSE,
+    nudge_x = -4.0,
+    nudge_y = 2.0
+  ) +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  ylim(-0.01, 220) +
+  xlim(-6, 6) +
+  labs(title = "ATAC Peaks in CD8+ Patients with OPN5 Treatment (log2(FC) +/- 1)",
+       x = "log2(fold change)",
+       y = "-log10(Adjusted P-value)") +
+  theme_classic(base_family = "Arial") +
+  theme(
+    text = element_text(size = 16, family = "Arial"),
+    axis.title = element_text(size = 16, family = "Arial"),
+    axis.text = element_text(size = 16, family = "Arial"),
+    plot.title = element_text(size = 16, face = "bold", family = "Arial")
+  )
+
+# Display the plot
+print(OPN5vVEH_vol_plot)
+
+# Save the plot
+ggsave(filename = "/Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/OPN5vVEH_l2FC1_volcano.png", 
+       plot = OPN5vVEH_vol_plot, width = 10, height = 8)
+```
+
+
+```
+# Plotting the final heatmaps
+
+# Combined signal:
+
+computeMatrix scale-regions -S Combined_Bigwigs/OPN5_combined.bigwig Combined_Bigwigs/VEH_combined.bigwig \
+    -R downregulated_combined_peaks_atleast3.bed upregulated_combined_peaks_atleast3.bed \
+    -a 3000 -b 3000 \
+    -o Heatmaps_on_Diff_signalmatrix_combined.gz \
+    --sortRegions descend \
+    --sortUsing mean \
+    -p 23
+
+plotHeatmap -m Heatmaps_on_Diff_signalmatrix_combined.gz -out heatmap_combined.png \
+    --sortRegions no \
+    --plotTitle "Combined Signal Across All Patients" \
+    --colorMap Reds \
+    --regionsLabel "Lost Peaks after Treatment" "Gained Peaks after Treatment" \
+    --zMax 70 \
+    --regionsLabel ""
+##########################################
+
+# Individual Patients
+
+computeMatrix scale-regions -S 2160_PLX5.pval.signal.bigwig 2160_VEH.pval.signal.bigwig \
+    -R downregulated_combined_peaks_atleast3.bed upregulated_combined_peaks_atleast3.bed \
+    -a 3000 -b 3000 \
+    -o Heatmaps_on_2160_matrix.gz \
+    -p 23
+    
+plotHeatmap -m Heatmaps_on_2160_matrix.gz -out heatmap_2160.png \
+    --plotTitle "ATAC Signal Across Patient 2160" \
+    --colorMap Reds \
+    --regionsLabel "Lost Peaks after Treatment" "Gained Peaks after Treatment" \
+    --zMax 70
+  
+#######################################
+
+computeMatrix scale-regions -S 2161_PLX5.pval.signal.bigwig 2161_VEH.pval.signal.bigwig \
+    -R downregulated_combined_peaks_atleast3.bed upregulated_combined_peaks_atleast3.bed \
+    -a 3000 -b 3000 \
+    -o Heatmaps_on_2161_matrix.gz \
+    -p 23
+    
+plotHeatmap -m Heatmaps_on_2161_matrix.gz -out heatmap_2161.png \
+    --plotTitle "ATAC Signal Across Patient 2161" \
+    --colorMap Reds \
+    --regionsLabel "Lost Peaks after Treatment" "Gained Peaks after Treatment" \
+    --zMax 70
+    
+#######################################    
+
+computeMatrix scale-regions -S 2281_PLX5.pval.signal.bigwig 2281_VEH.pval.signal.bigwig \
+    -R downregulated_combined_peaks_atleast3.bed upregulated_combined_peaks_atleast3.bed \
+    -a 3000 -b 3000 \
+    -o Heatmaps_on_2281_matrix.gz \
+    -p 23
+
+plotHeatmap -m Heatmaps_on_2281_matrix.gz -out heatmap_2281.png \
+    --plotTitle "ATAC Signal Across Patient 2281" \
+    --colorMap Reds \
+    --regionsLabel "Lost Peaks after Treatment" "Gained Peaks after Treatment" \
+    --zMax 70
+    
+#######################################
+    
+computeMatrix scale-regions -S 2920_PLX5.pval.signal.bigwig 2920_VEH.pval.signal.bigwig \
+    -R downregulated_combined_peaks_atleast3.bed upregulated_combined_peaks_atleast3.bed \
+    -a 3000 -b 3000 \
+    -o Heatmaps_on_2920_matrix.gz \
+    -p 23
+
+plotHeatmap -m Heatmaps_on_2920_matrix.gz -out heatmap_2920.png \
+    --plotTitle "ATAC Signal Across Patient 2920" \
+    --colorMap Reds \
+    --regionsLabel "Lost Peaks after Treatment" "Gained Peaks after Treatment" \
+    --zMax 70
+```
+
+
+
+### Patient annotation files
+Get individual patients annotations.  
+1. Only write out chr, start, end, M_value, P_value, and invert files M_value column.
+2. annotate that file
+3. merge annotation files
+
+
+```
+findMotifsGenome.pl /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/DiffPeaks/Patient_2160/output_filters/PLX5_specific_peaks.bed hg38 /Zulu/timrez/Projects/ElGamal_D/TCell_ATAC/ENCODE_Pipeline/Data_Analysis/MotifFootprinting/Patient_2160/HOMER_Res/OPN5
+
+findMotifsGenome.pl OPN5_vs_VEH_mavalues.tsv hg38 ../../GenomeAnnotation/Patient_2160/Overall
+findMotifsGenome.pl OPN5_vs_VEH_mavalues.tsv hg38 ../../GenomeAnnotation/Patient_2161/Overall
+findMotifsGenome.pl OPN5_vs_VEH_mavalues.tsv hg38 ../../GenomeAnnotation/Patient_2281/Overall
+findMotifsGenome.pl OPN5_vs_VEH_mavalues.tsv hg38 ../../GenomeAnnotation/Patient_2920/Overall
+
+annotatePeaks.pl OPN5_vs_VEH_mavalues.tsv hg38 > OPN5_vs_VEH_annotatedPeaks.txt
+```
+
+Audrey wants:
+1. ATAC-seq signal for each patient at the combined peaks files:
+  Take start, stop, chromosome, for each, output the signal in the untreated and treated bigwigs for ATAC-seq in separate columns.
+2. Annotations of those peaks.
+  Annotate once, overlay to the complete file. This might exist already?
+
+
